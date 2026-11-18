@@ -94,7 +94,7 @@ hist_data <- count %>%
 ################################
 #>>>>>>>>>sampling summary<<<<<<
 ################################
-p1<-ggplot(data = hist_data, aes(x = Month, y = n_total, fill = `Latin species name`)) +
+ggplot(data = hist_data, aes(x = Month, y = n_total, fill = `Latin species name`)) +
   geom_col(color = "black", linewidth = 0.2, position = "stack") +
   # Scales set to "free" for independent x and y axes across facets
   facet_wrap(~ `Metod ID`, scales = "free", ncol = 3) +
@@ -123,131 +123,6 @@ p1<-ggplot(data = hist_data, aes(x = Month, y = n_total, fill = `Latin species n
     strip.text = element_text(face = "bold")                        
   )
 
-################################
-#>>sampling representativenness<
-################################
-custom_month_order <- c("Initial", "April", "May", "June", "July",
-                        "August", "September", "October", "Harvest")
-# individuals
-df_stocking <- expand_grid(
-  `Metod ID` = unique(count$`Metod ID`),
-  data.frame(
-    `Latin species name` = c("Cyprinus carpio", "Rutilus rutilus", "Sander lucioperca",
-                             "Pseudorasbora parva", "Tinca tinca", "Scardinius erythrophthalmus"),
-    Initial = c(531, 59, 1500, 70000, 25, 119),
-    Harvest = c(373, 38, 88, 21290, 18, 76),
-    check.names = FALSE
-  )
-) %>%
-  pivot_longer(cols = c(Initial, Harvest), names_to = "Month", values_to = "n_total")
-
-# weight
-df_stocking <- expand_grid(
-  `Metod ID` = unique(count$`Metod ID`),
-  data.frame(
-    `Latin species name` = c("Cyprinus carpio", "Rutilus rutilus", "Sander lucioperca",
-                             "Pseudorasbora parva", "Tinca tinca", "Scardinius erythrophthalmus"),
-Initial = c(50050, 30450, 75300, 42000, 22350, 19800),
-Harvest = c(188350, 20950, 5500, 15160, 16000, 17410),
-check.names = FALSE
-)
-) %>%
-  pivot_longer(cols = c(Initial, Harvest), names_to = "Month", values_to = "n_total")
-
-hist_data_monthly <- count %>%
-  group_by(`Metod ID`, Month, `Latin species name`) %>%
-  summarise(n_total = sum(weight, na.rm = TRUE), .groups = "drop") %>%#############################
-  mutate(n_total = ifelse(`Latin species name` == "None", 0, n_total)) %>%
-  group_by(`Metod ID`) %>%
-  group_modify(~ if (.y$`Metod ID` == "P2") {
-    complete(.x,
-             Month = c("April", "May", "June", "July", "August", "October"),
-             `Latin species name`, fill = list(n_total = 0))
-  } else .x) %>%
-  ungroup() %>%
-  filter(!(`Metod ID` %in% c("PK", "P1", "P2", "L", "E") & Month == "September")) %>%
-  mutate(Month = as.character(Month))
-
-hist_data_combined <- bind_rows(df_stocking, hist_data_monthly) %>%
-  mutate(Month = factor(Month, levels = custom_month_order)) %>%
-  group_by(`Metod ID`, Month) %>%
-  mutate(
-    prop = n_total / sum(n_total, na.rm = TRUE),
-    prop = ifelse(is.nan(prop) | is.na(prop), 0, prop)
-  ) %>%
-  ungroup()
-
-ref_prop <- hist_data_combined %>%
-  filter(Month %in% c("Initial", "Harvest")) %>%
-  transmute(`Metod ID`, `Latin species name`,
-            ref = as.character(Month), ref_prop = prop)
-
-consistency <- hist_data_combined %>%
-  filter(!Month %in% c("Initial", "Harvest")) %>%
-  mutate(ref = if_else(Month %in% c("April", "May", "June"),
-                       "Initial",   # April–June   -> Initial
-                       "Harvest")) %>%  # July–December -> Harvest
-  left_join(ref_prop, by = c("Metod ID", "Latin species name", "ref")) %>%
-  mutate(ref_prop = replace_na(ref_prop, 0)) %>%
-  group_by(`Metod ID`, Month, ref) %>%
-  summarise(
-    total_n     = sum(n_total, na.rm = TRUE),
-    consistency = sum(pmin(prop, ref_prop)),  
-    .groups = "drop"
-  ) %>%
-  mutate(
-    consistency = if_else(total_n == 0, NA_real_, consistency), 
-    label = if_else(is.na(consistency), "",
-                    scales::percent(consistency, accuracy = 1))
-  )
-
-sp <- sort(unique(hist_data_combined$`Latin species name`))
-sp_cols <- setNames(brewer.pal(6, "Set3")[seq_along(sp)], sp)
-
-p3<-ggplot(hist_data_combined, aes(x = Month, y = prop, fill = `Latin species name`)) +
-  geom_col(color = "black", linewidth = 0.2, position = "fill") +
-  geom_text(
-    data = consistency,
-    aes(x = Month, y = 1, label = label),
-    inherit.aes = FALSE, vjust = -0.4, size = 3, fontface = "bold"
-  ) +
-  facet_wrap(~ `Metod ID`, scales = "free_x", ncol = 3) +
-  scale_x_discrete(drop = TRUE) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
-                     expand = expansion(mult = c(0, 0.1))) +
-  scale_fill_manual(values = sp_cols) +
-  guides(fill = guide_legend(title = "Species",
-                             label.theme = element_text(face = "italic"))) +
-  labs(
-    x = "Sampling Month",
-    y = "Proportion of Individuals (%)",
-    fill = "Species") +
-  theme_bw() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-    legend.position = "right",
-    panel.grid.major = element_line(color = "grey90"),
-    panel.grid.minor = element_blank(),
-    strip.background = element_rect(fill = alpha("grey90", 0.3), color = "grey80"),
-    strip.text = element_text(face = "bold")
-  )
-
-p1<-p1+labs(title="(A) Quantity summary")
-p2<-p2+labs(title="(B) Community representativeness summary by individuals")
-p3<-p3+labs(title="(C) Community representativeness summary by weight")
-
-layout_design <- "
-  AB
-  CL
-"
-final_plot <- (p1 + guide_area() + p2 + p3) + 
-  plot_layout(
-    design = layout_design, 
-    guides = "collect", 
-    heights = c(0.8, 1)  # Optional: slightly shrinks the first row height
-  )
-
-print(final_plot)
 #########################
 #>>>Rarefaction Curves<<<
 #########################
@@ -900,3 +775,113 @@ p <- ggplot(df_percent, aes(x = Country, y = Percent, fill = Gear)) +
   )
 
 p + scale_y_break(c(1.25, 95), scales = 0.8, space = 0.4)
+
+
+################################
+#>>sampling representativenness<
+################################
+custom_month_order <- c("Initial", "April", "May", "June", "July",
+                        "August", "September", "October", "Harvest")
+# individuals
+df_stocking <- expand_grid(
+  `Metod ID` = unique(count$`Metod ID`),
+  data.frame(
+    `Latin species name` = c("Cyprinus carpio", "Rutilus rutilus", "Sander lucioperca",
+                             "Pseudorasbora parva", "Tinca tinca", "Scardinius erythrophthalmus"),
+    Initial = c(531, 59, 1500, 70000, 25, 119),
+    Harvest = c(373, 38, 88, 21290, 18, 76),
+    check.names = FALSE
+  )
+) %>%
+  pivot_longer(cols = c(Initial, Harvest), names_to = "Month", values_to = "n_total")
+
+# weight
+df_stocking <- expand_grid(
+  `Metod ID` = unique(count$`Metod ID`),
+  data.frame(
+    `Latin species name` = c("Cyprinus carpio", "Rutilus rutilus", "Sander lucioperca",
+                             "Pseudorasbora parva", "Tinca tinca", "Scardinius erythrophthalmus"),
+Initial = c(50050, 30450, 75300, 42000, 22350, 19800),
+Harvest = c(188350, 20950, 5500, 15160, 16000, 17410),
+check.names = FALSE
+)
+) %>%
+  pivot_longer(cols = c(Initial, Harvest), names_to = "Month", values_to = "n_total")
+
+hist_data_monthly <- count %>%
+  group_by(`Metod ID`, Month, `Latin species name`) %>%
+  summarise(n_total = sum(weight, na.rm = TRUE), .groups = "drop") %>%#############################
+  mutate(n_total = ifelse(`Latin species name` == "None", 0, n_total)) %>%
+  group_by(`Metod ID`) %>%
+  group_modify(~ if (.y$`Metod ID` == "P2") {
+    complete(.x,
+             Month = c("April", "May", "June", "July", "August", "October"),
+             `Latin species name`, fill = list(n_total = 0))
+  } else .x) %>%
+  ungroup() %>%
+  filter(!(`Metod ID` %in% c("PK", "P1", "P2", "L", "E") & Month == "September")) %>%
+  mutate(Month = as.character(Month))
+
+hist_data_combined <- bind_rows(df_stocking, hist_data_monthly) %>%
+  mutate(Month = factor(Month, levels = custom_month_order)) %>%
+  group_by(`Metod ID`, Month) %>%
+  mutate(
+    prop = n_total / sum(n_total, na.rm = TRUE),
+    prop = ifelse(is.nan(prop) | is.na(prop), 0, prop)
+  ) %>%
+  ungroup()
+
+ref_prop <- hist_data_combined %>%
+  filter(Month %in% c("Initial", "Harvest")) %>%
+  transmute(`Metod ID`, `Latin species name`,
+            ref = as.character(Month), ref_prop = prop)
+
+consistency <- hist_data_combined %>%
+  filter(!Month %in% c("Initial", "Harvest")) %>%
+  mutate(ref = if_else(Month %in% c("April", "May", "June"),
+                       "Initial",   # April–June   -> Initial
+                       "Harvest")) %>%  # July–December -> Harvest
+  left_join(ref_prop, by = c("Metod ID", "Latin species name", "ref")) %>%
+  mutate(ref_prop = replace_na(ref_prop, 0)) %>%
+  group_by(`Metod ID`, Month, ref) %>%
+  summarise(
+    total_n     = sum(n_total, na.rm = TRUE),
+    consistency = sum(pmin(prop, ref_prop)),  
+    .groups = "drop"
+  ) %>%
+  mutate(
+    consistency = if_else(total_n == 0, NA_real_, consistency), 
+    label = if_else(is.na(consistency), "",
+                    scales::percent(consistency, accuracy = 1))
+  )
+
+sp <- sort(unique(hist_data_combined$`Latin species name`))
+sp_cols <- setNames(brewer.pal(6, "Set3")[seq_along(sp)], sp)
+
+p3<-ggplot(hist_data_combined, aes(x = Month, y = prop, fill = `Latin species name`)) +
+  geom_col(color = "black", linewidth = 0.2, position = "fill") +
+  geom_text(
+    data = consistency,
+    aes(x = Month, y = 1, label = label),
+    inherit.aes = FALSE, vjust = -0.4, size = 3, fontface = "bold"
+  ) +
+  facet_wrap(~ `Metod ID`, scales = "free_x", ncol = 3) +
+  scale_x_discrete(drop = TRUE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = sp_cols) +
+  guides(fill = guide_legend(title = "Species",
+                             label.theme = element_text(face = "italic"))) +
+  labs(
+    x = "Sampling Month",
+    y = "Proportion of Individuals (%)",
+    fill = "Species") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position = "right",
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = alpha("grey90", 0.3), color = "grey80"),
+    strip.text = element_text(face = "bold")
+  )
