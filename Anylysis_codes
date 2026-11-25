@@ -1,0 +1,981 @@
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(vegan)
+library(glmmTMB)
+library(ggeffects)
+library(performance)
+library(scales)
+library(patchwork)
+library(ggrepel)
+library(effectsize)
+library(multcompView)
+
+#Environment & Working Directory Setup
+Dir <- "D:/Sampling methods"  # Change to your repository path if needed
+setwd(Dir)
+try(Sys.setlocale("LC_TIME", "English"), silent = TRUE)
+
+data_file <- file.path(Dir, "Data.xls")
+pdf_dev   <- if (capabilities("cairo")) cairo_pdf else "pdf"
+
+# ------------------------------------------------------------------------------
+# DATA IMPORT & CLEANING ("ulovky" & "Stocking+harvest")
+# ------------------------------------------------------------------------------
+month_abbr   <- c("Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct")
+method_order <- c("PK", "P1", "P2", "L", "E", "C")
+non_target   <- c("Chondrostoma nasus", "Pelophylax esculentus", "tadpole", "Rana temporaria")
+
+raw_ulovky <- read_xls(data_file, sheet = "ulovky") %>%
+  mutate(
+    `Metod ID`  = if_else(as.character(`Metod ID`) == "C", "L", as.character(`Metod ID`)),
+    Metod_ID  = if_else(as.character(`Metod ID`) == "V", "C", as.character(`Metod ID`)),
+    Date      = as_date(Date),
+    Month     = factor(month(Date), levels = 4:10, labels = month_abbr),
+    Pond_No   = factor(`Pond No.`),
+    Metod_ID  = factor(Metod_ID, levels = method_order),
+    Sample_No = suppressWarnings(as.numeric(`Sample No.`)),
+    W_g       = suppressWarnings(as.numeric(`W (g)`)),
+    SL_mm     = suppressWarnings(as.numeric(`SL (mm)`)),
+    Number    = suppressWarnings(as.numeric(Number)),
+    Species   = as.character(`Latin species name`)
+  )
+
+# Standardize zero-catch deployments safely
+if ("Catch type" %in% names(raw_ulovky)) {
+  raw_ulovky <- raw_ulovky %>%
+    mutate(
+      is_nocatch = tolower(as.character(`Catch type`)) == "no catch" | is.na(Species) | Species == "None",
+      Number     = if_else(is_nocatch, 0, coalesce(Number, 0)),
+      Species    = if_else(is_nocatch, NA_character_, Species)
+    )
+} else {
+  raw_ulovky <- raw_ulovky %>%
+    mutate(
+      is_nocatch = is.na(Species) | Species == "None",
+      Number     = if_else(is_nocatch, 0, coalesce(Number, 0)),
+      Species    = if_else(is_nocatch, NA_character_, Species)
+    )
+}
+
+raw_ulovky <- raw_ulovky %>%
+  mutate(Event_ID = paste(Metod_ID, Month, Pond_No, Sample_No, sep = "_"))
+
+sampled_grid <- raw_ulovky %>%
+  filter(!is.na(Metod_ID), !is.na(Month)) %>%
+  distinct(Metod_ID, Month)
+
+deployments_per_gear <- raw_ulovky %>%
+  filter(!is.na(Metod_ID), !is.na(Month)) %>%
+  distinct(Event_ID, Metod_ID) %>%
+  count(Metod_ID, name = "n_dep")
+
+# Deployment-level table (1 row per replicate, includes all zeros)
+event_totals <- raw_ulovky %>%
+  filter(!is.na(Metod_ID), !is.na(Month)) %>%
+  mutate(
+    target_n = if_else(!is.na(Species) & !(Species %in% non_target), Number, 0),
+    target_w = if_else(!is.na(Species) & !(Species %in% non_target), coalesce(W_g, 0), 0)
+  ) %>%
+  group_by(Event_ID, Date, Month, Pond_No, Metod_ID, Sample_No) %>%
+  summarise(
+    total_catch  = sum(target_n, na.rm = TRUE),
+    total_weight = sum(target_w, na.rm = TRUE),
+    richness     = n_distinct(Species[!is.na(Species) & !(Species %in% non_target) & target_n > 0]),
+    .groups = "drop"
+  )
+
+fish_indiv <- raw_ulovky %>%
+  filter(!is.na(Species), !(Species %in% non_target), Number > 0)
+
+fish_by_event_sp <- fish_indiv %>%
+  group_by(Event_ID, Month, Pond_No, Metod_ID, Sample_No, Species) %>%
+  summarise(n_total = sum(Number, na.rm = TRUE), weight = sum(W_g, na.rm = TRUE), .groups = "drop")
+
+catch_monthly <- fish_by_event_sp %>%
+  group_by(Metod_ID, Month, Species) %>%
+  summarise(n_ind = sum(n_total), w_bio = sum(weight), .groups = "drop") %>%
+  right_join(sampled_grid, by = c("Metod_ID", "Month")) %>%
+  mutate(n_ind = replace_na(n_ind, 0), w_bio = replace_na(w_bio, 0))
+
+# ------------------------------------------------------------------------------
+# 4. COLORBLIND-SAFE PALETTES & NATURE THEME
+pal_methods <- c(
+  "PK" = "#D55E00", "P1" = "#0072B2", "P2" = "#56B4E9",
+  "L"  = "#009E73", "E"  = "#334155", "C"  = "#E69F00"
+)
+
+pal_species <- c(
+  "Pseudorasbora parva"         = "#E9C46A",
+  "Scardinius erythrophthalmus" = "#457B9D",
+  "Tinca tinca"                 = "#E76F51",
+  "Sander lucioperca"           = "#C1121F",
+  "Cyprinus carpio"             = "#2A9D8F",
+  "Rutilus rutilus"             = "#8E7DBE"
+)
+
+# ==============================================================================
+# MASTER SCRIPT (Continuation): Figures 2 through 5
+# ==============================================================================
+
+sp_abbr <- c(
+  "Pseudorasbora parva"         = "P. parva",
+  "Scardinius erythrophthalmus" = "S. erythrophthalmus",
+  "Tinca tinca"                 = "T. tinca",
+  "Sander lucioperca"           = "S. lucioperca",
+  "Cyprinus carpio"             = "C. carpio",
+  "Rutilus rutilus"             = "R. rutilus"
+)
+
+theme_nat <- function(base_size = 8.5) {
+  theme_minimal(base_size = base_size, base_family = "sans") +
+    theme(
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(color = "#EAECEF", linewidth = 0.28),
+      axis.line         = element_line(color = "#1F2937", linewidth = 0.35),
+      axis.ticks        = element_line(color = "#1F2937", linewidth = 0.3),
+      axis.ticks.length = unit(2, "pt"),
+      axis.text         = element_text(color = "#1F2937", size = base_size - 0.6),
+      axis.title        = element_text(color = "#111827", size = base_size),
+      strip.background  = element_rect(fill = "#F3F4F6", color = "#D1D5DB", linewidth = 0.35),
+      strip.text        = element_text(face = "bold", size = base_size - 0.3, color = "#111827"),
+      plot.title        = element_text(face = "bold", size = base_size + 0.8, hjust = 0, color = "#111827"),
+      plot.subtitle     = element_text(size = base_size - 0.8, hjust = 0, color = "#4B5563"),
+      plot.tag          = element_text(face = "bold", size = 11.5, color = "#111827"),
+      plot.margin       = margin(5, 7, 5, 5)
+    )
+}
+
+# ------------------------------------------------------------------------------
+# FIGURE 2: QUANTITY SUMMARY & REPRESENTATIVENESS (ABUNDANCE & BIOMASS)
+# ------------------------------------------------------------------------------
+read_num_range <- function(rng) {
+  suppressMessages(read_xls(data_file, sheet = "Stocking+harvest", range = rng, col_names = FALSE)) %>%
+    pull(1) %>% as.numeric()
+}
+
+stocked_sum_g   <- read_num_range("D7:D11") + read_num_range("I7:I11") + read_num_range("N7:N11")
+harvest_sum_g   <- read_num_range("R15:R19")
+stocked_sum_ind <- read_num_range("E7:E11") + read_num_range("J7:J11") + read_num_range("O7:O11")
+harvest_sum_ind <- read_num_range("S15:S19")
+
+ref_ind <- tibble(
+  Species = c("Cyprinus carpio", "Rutilus rutilus", "Sander lucioperca",
+              "Pseudorasbora parva", "Tinca tinca", "Scardinius erythrophthalmus"),
+  Stocked = c(stocked_sum_ind[1], round(stocked_sum_ind[3] * (1/3)), stocked_sum_ind[5],
+              round(stocked_sum_g[4] / 0.6), stocked_sum_ind[2], stocked_sum_ind[3] - round(stocked_sum_ind[3] * (1/3))),
+  Harvest = c(harvest_sum_ind[1], round(harvest_sum_ind[3] * (1/3)), harvest_sum_ind[5],
+              round(harvest_sum_g[4] / 0.6), harvest_sum_ind[2], harvest_sum_ind[3] - round(harvest_sum_ind[3] * (1/3)))
+) %>% pivot_longer(c(Stocked, Harvest), names_to = "Month", values_to = "value")
+
+ref_bio <- tibble(
+  Species = c("Cyprinus carpio", "Rutilus rutilus", "Scardinius erythrophthalmus",
+              "Pseudorasbora parva", "Tinca tinca", "Sander lucioperca"),
+  Stocked = c(stocked_sum_g[1], stocked_sum_g[3]*(1/3), stocked_sum_g[3]*(2/3) + stocked_sum_g[4]*0.220,
+              stocked_sum_g[4]*0.677, stocked_sum_g[2] + stocked_sum_g[4]*0.103, stocked_sum_g[5]),
+  Harvest = c(harvest_sum_g[1], harvest_sum_g[3]*(1/3), harvest_sum_g[3]*(2/3) + harvest_sum_g[4]*0.220,
+              harvest_sum_g[4]*0.677, harvest_sum_g[2] + harvest_sum_g[4]*0.103, harvest_sum_g[5])
+) %>% pivot_longer(c(Stocked, Harvest), names_to = "Month", values_to = "value")
+
+quant_totals <- catch_monthly %>% group_by(Metod_ID, Month) %>% summarise(tot = sum(n_ind), .groups = "drop")
+gear_badges  <- quant_totals %>%
+  group_by(Metod_ID) %>% summarise(N_gear = sum(tot), .groups = "drop") %>%
+  left_join(deployments_per_gear, by = "Metod_ID") %>%
+  mutate(badge = sprintf("N = %s\n(%.1f/dep.)", label_comma()(N_gear), N_gear / n_dep))
+
+p2_a <- ggplot(catch_monthly %>% filter(!is.na(Species)), aes(x = Month, y = n_ind, fill = Species)) +
+  geom_col(color = "#1F2937", linewidth = 0.18, width = 0.72) +
+  geom_text(data = quant_totals %>% filter(tot == 0), aes(x = Month, y = 0, label = "0"),
+            inherit.aes = FALSE, vjust = -0.35, size = 2.2, color = "#6B7280", fontface = "bold") +
+  facet_wrap(~ Metod_ID, scales = "free", ncol = 3) +
+  scale_fill_manual(values = pal_species, labels = sp_abbr, name = NULL) +
+  scale_y_continuous(labels = label_comma(), expand = expansion(mult = c(0, 0.24))) +
+  labs(tag = "(A)", title = "Quantity summary across sampling gears", x = NULL, y = "Individuals caught") +
+  theme_nat() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+build_rep_panel <- function(ref_df, value_col, tag_lbl, title_txt, ylab_txt) {
+  custom_m <- c("Stocked", month_abbr, "Harvest")
+  monthly_df <- catch_monthly %>%
+    transmute(Metod_ID, Month = as.character(Month), Species, value = .data[[value_col]])
+  
+  comb <- bind_rows(expand_grid(Metod_ID = factor(method_order, levels = method_order), ref_df), monthly_df) %>%
+    mutate(Month = factor(Month, levels = custom_m)) %>%
+    group_by(Metod_ID, Month) %>%
+    mutate(tot_val = sum(value, na.rm = TRUE), prop = if_else(tot_val > 0, value / tot_val, 0)) %>%
+    ungroup()
+  
+  zero_months <- comb %>% group_by(Metod_ID, Month) %>% summarise(tot_val = first(tot_val), .groups = "drop") %>% filter(tot_val == 0)
+  dividers    <- comb %>% distinct(Metod_ID, Month) %>% count(Metod_ID, name = "n_x") %>% mutate(x_stock = 1.5, x_harv = n_x - 0.5)
+  
+  ggplot(comb %>% filter(!is.na(Species), prop > 0), aes(x = Month, y = prop, fill = Species)) +
+    geom_col(color = "#1F2937", linewidth = 0.2, width = 0.82, position = "stack") +
+    geom_vline(data = dividers, aes(xintercept = x_stock), linetype = "dashed", color = "#1F2937", linewidth = 0.45) +
+    geom_vline(data = dividers, aes(xintercept = x_harv),  linetype = "dashed", color = "#1F2937", linewidth = 0.45) +
+    geom_text(data = zero_months, aes(x = Month, y = 0.03, label = "0"), inherit.aes = FALSE, size = 2.4, color = "#6B7280", fontface = "bold") +
+    facet_wrap(~ Metod_ID, scales = "free_x", ncol = 3) +
+    scale_fill_manual(values = pal_species, labels = sp_abbr, name = NULL) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.25), labels = label_percent(accuracy = 1), limits = c(0, 1.03), expand = expansion(mult = c(0, 0.02))) +
+    labs(tag = tag_lbl, title = title_txt, x = "Sampling period", y = ylab_txt) +
+    theme_nat(base_size = 9) +
+    theme(
+      legend.position   = "none",
+      axis.text.x       = element_text(angle = 35, hjust = 1, face = "bold", size = 8.5, color = "#1F2937"),
+      axis.text.y       = element_text(face = "bold", size = 8.5, color = "#1F2937"),
+      axis.title        = element_text(face = "bold", size = 10, color = "#111827"),
+      plot.tag          = element_text(face = "bold", size = 12, color = "#111827"),
+      plot.title        = element_text(face = "bold", size = 11.5, hjust = 0, color = "#111827"),
+      strip.text        = element_text(face = "bold", size = 9, color = "#111827"),
+      panel.border      = element_rect(color = "#1F2937", fill = NA, linewidth = 0.55),
+      panel.grid.major  = element_blank(),
+      panel.grid.minor  = element_blank()
+    )
+}
+
+res_ind_p <- build_rep_panel(ref_ind, "n_ind", "(B)", "Community representativeness by abundance", "Proportion of individuals (%)")
+res_bio_p <- build_rep_panel(ref_bio, "w_bio", "(C)", "Community representativeness by biomass",      "Proportion of biomass (%)")
+
+p2_a_clean <- p2_a +
+  scale_fill_manual(values = pal_species, labels = sp_abbr, name = "Species") +
+  guides(fill = guide_legend(ncol = 2, byrow = TRUE, override.aes = list(linewidth = 0.3))) +
+  theme(
+    plot.subtitle          = element_blank(),
+    plot.tag               = element_text(face = "bold", size = 12, color = "#111827"),
+    plot.title             = element_text(face = "bold", size = 11.5, hjust = 0, color = "#111827"),
+    axis.title             = element_text(face = "bold", size = 10, color = "#111827"),
+    axis.text              = element_text(face = "bold", size = 8.5, color = "#1F2937"),
+    panel.border           = element_rect(color = "#1F2937", fill = NA, linewidth = 0.55),
+    panel.grid.major       = element_blank(),
+    panel.grid.minor       = element_blank(),
+    legend.position        = "inside",
+    legend.position.inside = c(0.88, 0.78),
+    legend.background      = element_rect(fill = alpha("white", 0.90), color = "#CBD5E1", linewidth = 0.3),
+    legend.key             = element_blank(),
+    legend.key.size        = unit(8.5, "pt"),
+    legend.title           = element_text(face = "bold", size = 8, color = "#111827"),
+    legend.text            = element_text(face = "italic", size = 7.5, color = "#1F2937"),
+    legend.margin          = margin(3, 4, 3, 4)
+  )
+
+figure_2 <- p2_a_clean / (res_ind_p | res_bio_p) + plot_layout(heights = c(0.95, 1.05))
+ggsave("Figures/Fig2_Quantity_Representativeness.pdf", figure_2, width = 13.0, height = 9.0, units = "in", device = pdf_dev)
+
+# ------------------------------------------------------------------------------
+# FIGURE 3: RAREFACTION CURVES (Sample-based A & Individual-based B with CI)
+# ------------------------------------------------------------------------------
+comm_wide <- fish_by_event_sp %>%
+  pivot_wider(id_cols = Event_ID, names_from = Species, values_from = n_total, values_fill = 0) %>%
+  column_to_rownames("Event_ID")
+comm_wide <- comm_wide[rowSums(comm_wide) > 0, colSums(comm_wide) > 0]
+
+spec_accum_df <- map_dfr(method_order, function(m) {
+  ev_ids <- event_totals %>% filter(Metod_ID == m) %>% pull(Event_ID)
+  mat <- matrix(0, nrow = length(ev_ids), ncol = ncol(comm_wide), dimnames = list(ev_ids, colnames(comm_wide)))
+  common <- intersect(ev_ids, rownames(comm_wide))
+  if (length(common) > 0) mat[common, ] <- as.matrix(comm_wide[common, , drop = FALSE])
+  sa <- vegan::specaccum(mat, method = "exact")
+  tibble(Metod_ID = factor(m, levels = method_order), Effort = sa$sites, Richness = sa$richness,
+         Lower = pmax(0, sa$richness - 1.96 * sa$sd), Upper = sa$richness + 1.96 * sa$sd)
+})
+
+ind_rare_df <- map_dfr(method_order, function(m) {
+  sp_vec <- fish_by_event_sp %>% filter(Metod_ID == m) %>% group_by(Species) %>% summarise(n = sum(n_total), .groups = "drop") %>% pull(n)
+  n_tot <- sum(sp_vec)
+  if (n_tot < 2) return(NULL)
+  pts <- unique(round(exp(seq(0, log(n_tot), length.out = 60))))
+  pts <- pts[pts >= 1 & pts <= n_tot]
+  res <- vegan::rarefy(sp_vec, sample = pts, se = TRUE)
+  tibble(Metod_ID = factor(m, levels = method_order), Individuals = pts, Richness = as.numeric(res[1, ]),
+         SE = as.numeric(res[2, ]), Lower = pmax(1, Richness - 1.96 * SE), Upper = pmin(6, Richness + 1.96 * SE))
+})
+
+rare_theme <- theme_nat(base_size = 9) +
+  theme(
+    aspect.ratio     = 0.78,
+    panel.border     = element_rect(color = "#1F2937", fill = NA, linewidth = 0.65),
+    axis.line        = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.tag         = element_text(face = "bold", size = 12, color = "#111827"),
+    plot.title       = element_text(face = "bold", size = 12.5, hjust = 0, color = "#111827"),
+    plot.subtitle    = element_text(size = 8.8, hjust = 0, color = "#4B5563"),
+    axis.title       = element_text(face = "bold", size = 11.5, color = "#111827"),
+    axis.text        = element_text(face = "bold", size = 10, color = "#1F2937"),
+    axis.ticks       = element_line(color = "#1F2937", linewidth = 0.45)
+  )
+
+p3_a <- ggplot(spec_accum_df, aes(x = Effort, y = Richness, color = Metod_ID, fill = Metod_ID)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.08, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_label_repel(
+    data = spec_accum_df %>% group_by(Metod_ID) %>% slice_max(Effort, n = 1),
+    aes(label = Metod_ID),
+    nudge_x = c(PK = 4, P1 = -4, P2 = 4, L = 4, E = 4, C = 4),
+    nudge_y = c(PK = 0.25, P1 = 0.28, P2 = 0, L = 0, E = -0.22, C = 0),
+    fill = alpha("white", 0.85), linewidth = 0, label.padding = unit(0.12, "lines"),
+    size = 3.2, fontface = "bold", segment.color = "#9CA3AF", segment.linewidth = 0.3, show.legend = FALSE, seed = 42
+  ) +
+  scale_color_manual(values = pal_methods) + scale_fill_manual(values = pal_methods) +
+  scale_x_continuous(breaks = c(0, 30, 60, 90, 105), expand = expansion(mult = c(0.03, 0.08))) +
+  scale_y_continuous(breaks = 0:6) + coord_cartesian(xlim = c(0, 114), ylim = c(0, 6.5)) +
+  labs(tag = "(A)", title = "Sample-based species accumulation", subtitle = "Species detected by sampling effort (shading = 95% CI)",
+       x = "Number of replicates", y = "Expected species richness") + rare_theme
+
+end_pts_b <- ind_rare_df %>% group_by(Metod_ID) %>% slice_max(Individuals, n = 1) %>% ungroup()
+
+p3_b <- ggplot(ind_rare_df, aes(x = Individuals, y = Richness, color = Metod_ID, fill = Metod_ID)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.08, color = NA) +
+  geom_line(linewidth = 1.1) + geom_point(data = end_pts_b, size = 3.2) +
+  geom_label_repel(
+    data = end_pts_b, aes(label = sprintf("%s (%s)", Metod_ID, label_comma()(Individuals))),
+    nudge_x = c(PK = -0.18, P1 = -0.20, P2 = 0, L = 0.12, E = 0.14, C = -0.18),
+    nudge_y = c(PK = 0.25, P1 = 0.28, P2 = -0.28, L = -0.22, E = -0.25, C = 0.28),
+    fill = alpha("white", 0.85), linewidth = 0, label.padding = unit(0.12, "lines"),
+    size = 3.0, fontface = "bold", segment.color = "#9CA3AF", segment.linewidth = 0.3, show.legend = FALSE, seed = 42
+  ) +
+  scale_x_log10(breaks = c(1, 5, 25, 100, 500, 1000), labels = label_comma()) +
+  scale_color_manual(values = pal_methods) + scale_fill_manual(values = pal_methods) +
+  scale_y_continuous(breaks = 1:6) + coord_cartesian(xlim = c(0.95, 1550), ylim = c(1, 6.5)) +
+  labs(tag = "(B)", title = "Individual-based rarefaction", subtitle = "Expected richness standardized by individuals caught (log scale)",
+       x = bquote(bold("Individuals sampled (" * log[10] * " scale)")), y = "Expected species richness") + rare_theme
+
+Figure_3 <- (p3_a | p3_b) + plot_layout(guides = "collect") & theme(legend.position = "none")
+ggsave("Figures/Fig3_Rarefaction_Curves.pdf", Figure_3, width = 11.2, height = 5.2, units = "in", device = pdf_dev)
+
+# ------------------------------------------------------------------------------
+# FIGURE 4: NMDS (A), PERMDISP (B) & PAIRWISE CPUE (C)
+# ------------------------------------------------------------------------------
+meta_nmds <- event_totals %>% filter(Event_ID %in% rownames(comm_wide)) %>% slice(match(rownames(comm_wide), Event_ID))
+set.seed(123); nmds_res <- metaMDS(comm_wide, distance = "bray", k = 2, trymax = 500, trace = FALSE)
+set.seed(123); perm_res <- adonis2(comm_wide ~ Metod_ID + Month, data = meta_nmds, strata = meta_nmds$Pond_No, method = "bray", permutations = 9999, by = "margin")
+disp_dist <- vegdist(comm_wide, method = "bray"); bd <- betadisper(disp_dist, meta_nmds$Metod_ID, type = "centroid")
+set.seed(123); bd_perm <- permutest(bd, permutations = 9999, pairwise = TRUE)
+
+nmds_df <- as.data.frame(nmds_res$points) %>% rownames_to_column("Event_ID") %>% left_join(meta_nmds, by = "Event_ID") %>% mutate (MDS1 = MDS1 * -1)
+xlim_zoom <- c(-0.98, 1.15); ylim_zoom <- c(-1.12, 1.55)
+nmds_cent <- nmds_df %>% group_by(Metod_ID) %>% summarise(n = n(), cx = mean(MDS1), cy = mean(MDS2), se_x = sd(MDS1)/sqrt(n), se_y = sd(MDS2)/sqrt(n), .groups = "drop")
+nmds_inframe <- nmds_df %>% filter(between(MDS1, -0.95, 1.10), between(MDS2, -1.08, 1.08))
+n_outliers <- nrow(nmds_df) - nrow(nmds_inframe)
+nmds_all_sp <- nmds_inframe %>% inner_join(select(fish_by_event_sp, Event_ID, Species), by = "Event_ID") %>% arrange(desc(Species == "Pseudorasbora parva"))
+
+perm_txt_A <- sprintf("Stress = %.3f\nPERMANOVA: F = %.2f, p < 0.001\nPERMDISP: F = %.2f, p < 0.001", nmds_res$stress, perm_res$F[1], bd_perm$tab[1, "F"])
+sp_labels <- c(
+  "Pseudorasbora parva"         = "P. parva",
+  "Scardinius erythrophthalmus" = "S. erythrophthalmus",
+  "Tinca tinca"                 = "T. tinca",
+  "Sander lucioperca"           = "S. lucioperca",
+  "Cyprinus carpio"             = "C. carpio",
+  "Rutilus rutilus"             = "R. rutilus"
+)
+
+make_cov_ellipse <- function(d, level = 0.35, n_points = 181L) {xy<-as.matrix(d[,c("MDS1","MDS2")])
+xy<-xy[complete.cases(xy),,drop=F];grp<-as.character(d$Metod_ID[1])
+if(nrow(xy)<3) {return(tibble(MDS1=0,MDS2=0,Metod_ID=grp))};
+S<-cov(xy);
+if(!all(is.finite(S))){return(tibble(MDS1=0,MDS2=0,Metod_ID=grp))};
+eig<-eigen(S,symmetric=T,only.values=T)$values;tol<-max(eig)*1e-10;
+if(min(eig)<=tol){return(tibble(MDS1=0,MDS2=0,Metod_ID=grp))};
+R<-tryCatch(chol(S),error=function(e)NULL);
+if(is.null(R)){return(tibble(MDS1=0,MDS2=0,Metod_ID=grp))};
+theta<-seq(0,2*pi,length.out=n_points);unit_circle<-cbind(cos(theta),sin(theta));center<-colMeans(xy);
+ellipse_xy<-sweep(unit_circle%*%R*sqrt(qchisq(level,df=2)),2,center,"+");
+tibble(MDS1=ellipse_xy[,1],MDS2=ellipse_xy[,2],Metod_ID=grp)}
+split_nmds <- split(nmds_df, nmds_df$Metod_ID, drop = TRUE)
+ellipse_list <- lapply(split_nmds, make_cov_ellipse)
+ellipse_df <- bind_rows(ellipse_list)
+ellipse_df$Metod_ID <- factor(ellipse_df$Metod_ID,levels=method_order)
+
+p4_a_nmds <- ggplot() +
+  geom_hline(yintercept=0, linetype="dashed", color="#E5E7EB", linewidth=0.35) +
+  geom_vline(xintercept=0, linetype="dashed", color="#E5E7EB", linewidth=0.35) +
+  geom_polygon(data=ellipse_df, aes(x=MDS1,y=MDS2,group=Metod_ID,color=Metod_ID,fill=Metod_ID), alpha=0.1, linewidth=0.55) +
+  geom_point(data = nmds_all_sp, aes(x = MDS1, y = MDS2, color = Metod_ID, shape = Species), size = 2.4, alpha = 0.72, position = position_jitter(width = 0.035, height = 0.035, seed = 123)) +
+  geom_segment(data = nmds_cent, aes(x = cx - se_x, xend = cx + se_x, y = cy, yend = cy, color = Metod_ID), linewidth = 0.9, show.legend = FALSE) +
+  geom_segment(data = nmds_cent, aes(x = cx, xend = cx, y = cy - se_y, yend = cy + se_y, color = Metod_ID), linewidth = 0.9, show.legend = FALSE) +
+  geom_point(data = nmds_cent, aes(x = cx, y = cy), size = 5.6, color = "white", show.legend = FALSE) +
+  geom_point(data = nmds_cent, aes(x = cx, y = cy, color = Metod_ID), size = 4.2, show.legend = FALSE) +
+  annotate("text", x = xlim_zoom[1] + 0.04, y = ylim_zoom[2] - 0.05, label = perm_txt_A, hjust = 0, vjust = 1, size = 3.0, lineheight = 1.22, color = "#111827") +
+  scale_color_manual(values = pal_methods, guide = "none") +
+  scale_fill_manual(values = pal_methods, name = "Method", drop = FALSE) +
+  scale_shape_manual(values = c("Pseudorasbora parva"=16, "Scardinius erythrophthalmus"=17, "Tinca tinca"=15, "Sander lucioperca"=18, "Cyprinus carpio"=8, "Rutilus rutilus"=10), labels = sp_labels, name = "Species", drop = FALSE) +
+  guides(fill = guide_legend(order = 1, ncol = 6, override.aes = list(alpha = 0.45, linewidth = 0.5)),
+         shape = guide_legend(order = 2, ncol = 2, label.theme = element_text(face = "italic", size = 8.5), override.aes = list(size = 2.9, color = "#1F2937", alpha = 1))) +
+  coord_cartesian(xlim = xlim_zoom, ylim = ylim_zoom) +
+  labs(tag = "(A)", title = "Community ordination (NMDS)", x = "NMDS1", y = "NMDS2") +
+  theme_minimal(base_size = 9, base_family = "sans") +
+  theme(aspect.ratio = 0.78, panel.border = element_rect(color = "#1F2937", fill = NA, linewidth = 0.65), axis.line = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        plot.tag = element_text(face = "bold", size = 12, color = "#111827"), plot.title = element_text(face = "bold", size = 12.5, hjust = 0, color = "#111827"),
+        axis.title = element_text(face = "bold", size = 11.5, color = "#111827"), axis.text = element_text(face = "bold", size = 10, color = "#1F2937"),
+        legend.position = "inside", legend.position.inside = c(0.985, 0.585), legend.justification = c(1, 1), legend.box = "vertical", legend.spacing.y = unit(3, "pt"),
+        legend.background = element_blank(), legend.box.background = element_rect(fill = alpha("white", 0.92), color = "#D1D5DB", linewidth = 0.25), ,   axis.ticks       = element_line(linewidth = 0.68), axis.ticks.length = unit(3.2, "pt"),
+        legend.key = element_blank(), legend.title = element_text(size = 8.5, face = "bold", color = "#111827"), legend.text = element_text(size = 8.5, face = "bold"), plot.margin = margin(6, 8, 6, 6))
+
+bd_df <- tibble(Metod_ID = factor(as.character(bd$group), levels = method_order), Distance = as.numeric(bd$distances))
+bd_stats <- bd_df %>% group_by(Metod_ID) %>% summarise(n = n(), y_top = max(Distance), .groups = "drop")
+if (requireNamespace("multcompView", quietly = TRUE)) {
+  pw_p <- p.adjust(bd_perm$pairwise$permuted, method = "BH")
+  cld_vec <- multcompView::multcompLetters(pw_p, threshold = 0.05)$Letters
+  bd_stats <- bd_stats %>% mutate(letter = cld_vec[as.character(Metod_ID)])
+} else { bd_stats <- bd_stats %>% mutate(letter = "") }
+
+bd_txt_B <- sprintf("PERMDISP: F = %.2f, p < 0.001\n(\u25C6 = mean)", bd_perm$tab[1, "F"])
+
+p4_b_disp <- ggplot(bd_df, aes(x = Metod_ID, y = Distance)) +
+  geom_hline(yintercept = mean(bd_df$Distance), linetype = "dashed", color = "#CBD5E1", linewidth = 0.45) +
+  geom_violin(aes(fill = Metod_ID, color = Metod_ID), scale = "width", width = 0.78, trim = TRUE, alpha = 0.22, linewidth = 0.45, show.legend = FALSE) +
+  geom_jitter(aes(color = Metod_ID), width = 0.11, height = 0, shape = 16, size = 1.5, alpha = 0.42, show.legend = FALSE) +
+  geom_boxplot(width = 0.18, fill = "white", color = "#111827", alpha = 0.90, outlier.shape = NA, linewidth = 0.55, show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2.6, fill = "white", color = "#111827", stroke = 0.85, show.legend = FALSE) +
+  geom_text(data = bd_stats, aes(x = Metod_ID, y = y_top + 0.045, label = letter), size = 3.2, fontface = "bold", color = "#111827") +
+  geom_text(data = bd_stats, aes(x = Metod_ID, y = -0.055, label = paste0("n=", n)), size = 2.8, fontface = "bold", color = "#4B5563") +
+  annotate("text", x = 0.60, y = max(bd_df$Distance) * 1.18 * 0.98, label = bd_txt_B, hjust = 0, vjust = 1, size = 3.0, lineheight = 1.22, color = "#111827") +
+  scale_fill_manual(values = pal_methods, guide = "none") + scale_color_manual(values = pal_methods, guide = "none") +
+  scale_y_continuous(limits = c(-0.09, max(bd_df$Distance) * 1.18), breaks = seq(0, 1.0, by = 0.2), expand = expansion(mult = c(0.01, 0.02))) +
+  labs(tag = "(B)", title = "Multivariate dispersion (PERMDISP)", x = "Sampling gear", y = "Distance to centroid") +
+  theme_minimal(base_size = 9, base_family = "sans") +
+  theme(aspect.ratio = 0.78, panel.border = element_rect(color = "#1F2937", fill = NA, linewidth = 0.65), axis.line = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        plot.tag = element_text(face = "bold", size = 12, color = "#111827"), plot.title = element_text(face = "bold", size = 12.5, hjust = 0, color = "#111827"),    axis.ticks       = element_line(linewidth = 0.68), axis.ticks.length = unit(3.2, "pt"),
+        axis.title = element_text(face = "bold", size = 11.5, color = "#111827"), axis.text = element_text(face = "bold", size = 10, color = "#1F2937"), plot.margin = margin(6, 8, 6, 6))
+
+calc_rb <- function(b, a) {
+  if (requireNamespace("effectsize", quietly = TRUE)) return(effectsize::rank_biserial(b, a)$r_rank_biserial)
+  w <- suppressWarnings(wilcox.test(b, a, exact = FALSE)$statistic); as.numeric((2 * w) / (length(b) * length(a)) - 1)
+}
+get_x <- function(m) event_totals$total_catch[event_totals$Metod_ID == m]
+pair_df <- combn(method_order, 2, simplify = FALSE) %>% map_dfr(function(m) {
+  a <- get_x(m[1]); b <- get_x(m[2]); tibble(col = m[1], row = m[2], p_raw = suppressWarnings(wilcox.test(b, a)$p.value), r = calc_rb(b, a))
+}) %>% mutate(p_adj = p.adjust(p_raw, method = "BH"))
+
+star <- function(p) case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ "ns")
+lower <- pair_df %>% mutate(Group2 = factor(col, levels = method_order), Group1 = factor(row, levels = rev(method_order)), lab = paste0(sprintf("%+.2f", r), "\n", star(p_adj)), txt_col = if_else(abs(r) >= 0.55, "white", "#111827"))
+diag_df <- event_totals %>% count(Metod_ID) %>% transmute(Group2 = factor(Metod_ID, levels = method_order), Group1 = factor(Metod_ID, levels = rev(method_order)), lab = paste0(Metod_ID, "\n(n = ", n, ")"))
+
+p4_c_pair <- ggplot() +
+  geom_tile(data = diag_df, aes(Group2, Group1), fill = "#E2E8F0", color = "white", linewidth = 0.9) +
+  geom_tile(data = lower, aes(Group2, Group1, fill = r), color = "white", linewidth = 0.9) +
+  geom_text(data = lower, aes(Group2, Group1, label = lab, color = I(txt_col)), size = 3.2, lineheight = 0.92, fontface = "bold") +
+  geom_text(data = diag_df, aes(Group2, Group1, label = lab), size = 2.9, color = "#0F172A", fontface = "bold", lineheight = 0.95) +
+  scale_fill_gradient2(low = "#0072B2", mid = "#F8FAFC", high = "#D55E00", midpoint = 0, limits = c(-1, 1), name = "Rank-biserial r\n(+ = row higher)",
+                       guide = guide_colorbar(barheight = unit(55, "pt"), barwidth = unit(7, "pt"))) +
+  scale_x_discrete(limits = method_order, position = "bottom", expand = c(0, 0)) +
+  scale_y_discrete(limits = rev(method_order), expand = c(0, 0)) + coord_fixed(ratio = 1) +
+  labs(tag = "(C)", title = "Pairwise capturing efficiency comparison", x = NULL, y = NULL) +
+  theme_nat(base_size = 9) +
+  theme(panel.grid.major  = element_blank(), axis.ticks = element_blank(), panel.border = element_rect(color = "#111827", fill = NA, linewidth = 0.35),
+        plot.tag = element_text(face = "bold", size = 12, color = "#111827"), plot.title = element_text(face = "bold", size = 12.5, hjust = 0, color = "#111827"),
+        axis.text = element_text(face = "bold", size = 10, color = "#111827"), legend.position = "inside", legend.position.inside = c(0.84, 0.72),
+        legend.title = element_text(size = 8, face = "bold"), legend.text = element_text(size = 7.5))
+
+Figure_4 <- ((p4_a_nmds | p4_b_disp)/p4_c_pair) + plot_layout(widths = c(1.18, 1.05, 0.95))
+ggsave("Figures/Fig4_Community_Dispersion_CPUE.pdf", Figure_4 , width = 16.5, height = 5.6, units = "in", device = pdf_dev)
+
+
+# ==============================================================================
+# FIGURE 5: FOUR-PANEL MASTER FIGURE
+# Economics, operational requirements and global transferability
+# ==============================================================================
+gear_lv <- c(  "Trap",  "Lift net",  "Cast net",  "Electrofishing")
+
+pal_gear <- c(  "Trap"           = "#D55E00",
+  "Lift net"       = "#009E73",
+  "Cast net"       = "#E69F00",
+  "Electrofishing" = "#334155")
+
+pal_countries <- c(  "Bangladesh"     = "#E69F00",
+  "Nigeria"        = "#009E73",
+  "US"             = "#0072B2",
+  "This study (CZ)" = "#D55E00")
+
+# Consistent gear ordering across all panels
+y_scale <- scale_y_discrete(
+  limits = rev(gear_lv),
+  drop = FALSE
+)
+
+gear_df <- tibble(
+  gear = gear_lv,
+  device_eur = c(5.8, 25.0, 136.0, 13010.0),
+  op_eur = c(31.0, 10.0, 12.0, 189.0),
+  install = c("\u22483 h", "\u22481 h", "\u22481 h", "\u22480.5 h"),
+  operators = c("1", "1", "1", "3"),
+  training = c("Moderate", "Easy", "Moderate", "Strict (license)")
+) %>%
+  mutate(
+    gear = factor(gear, levels = gear_lv),
+    gear_chr = as.character(gear),
+    times_trap = device_eur / min(device_eur)
+  )
+
+#OPERATIONAL REQUIREMENTS TABLE
+
+work_df <- gear_df %>%
+  select(
+    gear,
+    `Set-up time` = install,
+    Operators = operators,
+    Training = training
+  ) %>%
+  pivot_longer(
+    cols = -gear,
+    names_to = "item",
+    values_to = "value"
+  ) %>%
+  mutate(
+    gear = factor(gear, levels = gear_lv),
+    item = factor(
+      item,
+      levels = c("Set-up time", "Operators", "Training")
+    )
+  )
+
+# INTERNATIONAL PRICE COMPARISON DATA
+
+cost_table_s2 <- tibble(
+  Country = rep(
+    c("Nigeria", "US", "Bangladesh", "This study (CZ)"),
+    each = 4
+  ),
+  Gear = rep(gear_lv, 4),
+  Price_EUR = c(
+    10.20, 126.37, 50.73, 12012.27,
+    7.52, 80.58, 61.33, 12012.27,
+    1.59, 35.40, 28.32, 12012.27,
+    5.80, 25.00, 136.00, 13010.00
+  )
+) %>%
+  mutate(
+    Country = factor(
+      Country,
+      levels = c(
+        "Bangladesh",
+        "Nigeria",
+        "US",
+        "This study (CZ)"
+      )
+    ),
+    Gear = factor(Gear, levels = gear_lv),
+    Country_chr = as.character(Country),
+    Gear_chr = as.character(Gear)
+  )
+
+#PRICE RANGES AND RELATIVE COST RATIOS
+
+gear_ranges <- cost_table_s2 %>%
+  group_by(Gear) %>%
+  summarise(
+    min_p = min(Price_EUR, na.rm = TRUE),
+    max_p = max(Price_EUR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Gear = factor(Gear, levels = gear_lv),
+    ratio_label = case_when(
+      as.character(Gear) == "Trap" ~ "1\u00d7 (ref.)",
+      as.character(Gear) == "Lift net" ~ "4\u201322\u00d7 trap",
+      as.character(Gear) == "Cast net" ~ "5\u201323\u00d7 trap",
+      as.character(Gear) == "Electrofishing" ~ "1,180\u20137,550\u00d7 trap"
+    )
+  )
+
+#FIGURE THEME
+
+theme_fig5_master <- function(base_size = 9) {
+  
+  theme_minimal(
+    base_size = base_size,
+    base_family = "sans"
+  ) +
+    
+    theme(
+      panel.border = element_rect(
+        colour = "#1F2937",
+        fill = NA,
+        linewidth = 0.65
+      ),
+      
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      
+      axis.line = element_blank(),
+      
+      axis.ticks = element_line(
+        colour = "#1F2937",
+        linewidth = 0.45
+      ),
+      
+      axis.ticks.length = unit(2.5, "pt"),
+      
+      axis.text = element_text(
+        face = "bold",
+        size = 9,
+        colour = "#1F2937"
+      ),
+      
+      axis.title = element_text(
+        face = "bold",
+        size = 10,
+        colour = "#111827"
+      ),
+      
+      plot.tag = element_text(
+        face = "bold",
+        size = 12,
+        colour = "#111827"
+      ),
+      
+      plot.title = element_text(
+        face = "bold",
+        size = 11,
+        hjust = 0,
+        colour = "#111827"
+      ),
+      
+      plot.subtitle = element_text(
+        size = 8.2,
+        hjust = 0,
+        colour = "#4B5563"
+      ),
+      
+      plot.margin = margin(5, 7, 5, 5)
+    )
+}
+
+# ------------------------------------------------------------------------------
+# PANEL A: DEVICE PURCHASE PRICE
+# ------------------------------------------------------------------------------
+
+p5_a <- ggplot(
+  gear_df,
+  aes(
+    x = device_eur,
+    y = gear,
+    colour = gear_chr
+  )
+) +
+  
+  geom_vline(
+    xintercept = 5.8,
+    linetype = "dashed",
+    colour = "#CBD5E1",
+    linewidth = 0.45
+  ) +
+  
+  geom_segment(
+    aes(
+      x = 1,
+      xend = device_eur,
+      yend = gear
+    ),
+    linewidth = 1.0
+  ) +
+  
+  geom_point(size = 3.4) +
+  
+  geom_text(
+    aes(
+      label = sprintf(
+        "\u20ac%s  (\u00d7%s)",
+        label_comma(
+          accuracy = 0.1,
+          drop0trailing = TRUE
+        )(device_eur),
+        label_comma(
+          accuracy = 1
+        )(times_trap)
+      )
+    ),
+    hjust = -0.10,
+    size = 3.0,
+    fontface = "bold",
+    colour = "#111827"
+  ) +
+  
+  scale_x_log10(
+    limits = c(0.8, 3.5e5),
+    breaks = c(1, 10, 100, 1000, 10000),
+    labels = label_comma(),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  
+  scale_colour_manual(
+    values = pal_gear,
+    limits = gear_lv,
+    drop = FALSE,
+    guide = "none"
+  ) +
+  
+  y_scale +
+  
+  labs(
+    tag = "A)",
+    title = "Device purchase price",
+    x = bquote(bold("Price per device (\u20ac, " * log[10] * " scale)")),
+    y = NULL
+  ) +
+  
+  theme_fig5_master() +
+  
+  theme(
+    axis.text.y = element_text(
+      face = "bold",
+      size = 9.5,
+      colour = "#111827"
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# PANEL B: COST PER OPERATION
+# ------------------------------------------------------------------------------
+
+p5_b <- ggplot(
+  gear_df,
+  aes(
+    x = op_eur,
+    y = gear,
+    fill = gear_chr
+  )
+) +
+  
+  geom_col(
+    width = 0.58,
+    colour = "#1F2937",
+    linewidth = 0.25
+  ) +
+  
+  geom_text(
+    aes(
+      label = paste0("\u20ac", op_eur)
+    ),
+    hjust = -0.18,
+    size = 3.0,
+    fontface = "bold",
+    colour = "#111827"
+  ) +
+  
+  scale_x_continuous(
+    limits = c(0, 235),
+    breaks = c(0, 50, 100, 150, 200),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  scale_fill_manual(
+    values = pal_gear,
+    limits = gear_lv,
+    drop = FALSE,
+    guide = "none"
+  ) +
+  
+  y_scale +
+  
+  labs(
+    tag = "B)",
+    title = "Cost per operation",
+    x = "Operational cost (\u20ac)",
+    y = NULL
+  ) +
+  
+  theme_fig5_master() +
+  
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+# ------------------------------------------------------------------------------
+# PANEL C: WORKLOAD AND OPERATIONAL REQUIREMENTS
+# ------------------------------------------------------------------------------
+
+p5_c <- ggplot(
+  work_df,
+  aes(
+    x = item,
+    y = gear
+  )
+) +
+  
+  geom_tile(
+    fill = "#F8FAFC",
+    colour = "#CBD5E1",
+    linewidth = 0.55
+  ) +
+  
+  geom_text(
+    aes(label = value),
+    size = 3.0,
+    fontface = "bold",
+    colour = "#0F172A"
+  ) +
+  
+  scale_x_discrete(
+    position = "top",
+    expand = c(0, 0)
+  ) +
+  
+  y_scale +
+  
+  labs(
+    tag = "C)",
+    title = "Workload & effort",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  theme_fig5_master() +
+  
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    
+    axis.text.x = element_text(
+      face = "bold",
+      size = 9,
+      colour = "#111827",
+      margin = margin(b = 2)
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# PANEL D: CROSS-NATIONAL PRICE COMPARISON
+# ------------------------------------------------------------------------------
+
+p5_d <- ggplot() +
+  
+  geom_segment(
+    data = gear_ranges,
+    aes(
+      x = min_p,
+      xend = max_p,
+      y = Gear,
+      yend = Gear
+    ),
+    colour = "#E2E8F0",
+    linewidth = 2.4,
+    lineend = "round"
+  ) +
+  
+  geom_point(
+    data = cost_table_s2,
+    aes(
+      x = Price_EUR,
+      y = Gear,
+      fill = Country_chr,
+      shape = Country_chr
+    ),
+    size = 3.4,
+    colour = "#1F2937",
+    stroke = 0.6,
+    alpha = 0.95,
+    position = position_dodge(width = 0.42)
+  ) +
+  
+  geom_label(
+    data = gear_ranges,
+    aes(
+      x = max_p * 1.55,
+      y = Gear,
+      label = ratio_label
+    ),
+    hjust = 0,
+    size = 2.85,
+    fontface = "bold",
+    colour = "#334155",
+    fill = alpha("#F8FAFC", 0.95),
+    label.size = 0.25,
+    label.padding = unit(0.2, "lines")
+  ) +
+  
+  scale_x_log10(
+    limits = c(0.8, 4.5e5),
+    breaks = c(1, 10, 100, 1000, 10000, 100000),
+    labels = c(
+      "\u20ac1",
+      "\u20ac10",
+      "\u20ac100",
+      "\u20ac1,000",
+      "\u20ac10,000",
+      "\u20ac100,000"
+    ),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  
+  y_scale +
+  
+  scale_fill_manual(
+    values = pal_countries,
+    limits = names(pal_countries),
+    drop = FALSE,
+    name = "Country"
+  ) +
+  
+  scale_shape_manual(
+    values = c(
+      "Bangladesh" = 21,
+      "Nigeria" = 22,
+      "US" = 24,
+      "This study (CZ)" = 23
+    ),
+    limits = names(pal_countries),
+    drop = FALSE,
+    name = "Country"
+  ) +
+  
+  guides(
+    fill = guide_legend(
+      nrow = 1,
+      override.aes = list(size = 3.2)
+    ),
+    shape = guide_legend(nrow = 1)
+  ) +
+  
+  labs(
+    tag = "D)",
+    title = "Cross-national price comparison and relative investment ratios",
+    subtitle = "Retail purchase prices across 4 countries; labels show cost multipliers relative to a local trap",
+    x = bquote(bold("Retail purchase price (\u20ac, " * log[10] * " scale)")),
+    y = NULL
+  ) +
+  
+  theme_fig5_master() +
+  
+  theme(
+    axis.text.y = element_text(
+      face = "bold",
+      size = 9.5,
+      colour = "#111827"
+    ),
+    
+    legend.position = "bottom",
+    
+    legend.title = element_text(
+      face = "bold",
+      size = 8.5,
+      colour = "#111827"
+    ),
+    
+    legend.text = element_text(
+      face = "bold",
+      size = 8.5,
+      colour = "#1F2937"
+    ),
+    
+    legend.margin = margin(t = 2)
+  )
+
+# ------------------------------------------------------------------------------
+# ASSEMBLE FOUR PANELS
+# ------------------------------------------------------------------------------
+
+row_top <- (p5_a | p5_b) +
+  plot_layout(
+    widths = c(1.65, 1.05, 1.35)
+  )
+row_below <- (p5_c | p5_d) +
+  plot_layout(
+    widths = c(1.65, 1.05, 1.35)
+  )
+
+Figure_5 <- row_top / row_below 
+
+print(Figure_5)
+ggsave(
+  filename = "Figures/Figure_5_master_economics_global_transferability.pdf",  plot = Figure_5,
+  width = 16,  height = 11,  units = "in",  device = cairo_pdf,  bg = "white")
