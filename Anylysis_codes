@@ -413,7 +413,7 @@ bd_df <- tibble(Metod_ID = factor(as.character(bd$group), levels = method_order)
 bd_stats <- bd_df %>% group_by(Metod_ID) %>% summarise(n = n(), y_top = max(Distance), .groups = "drop")
 if (requireNamespace("multcompView", quietly = TRUE)) {
   pw_p <- p.adjust(bd_perm$pairwise$permuted, method = "BH")
-  cld_vec <- multcompView::multcompLetters(pw_p, threshold = 0.05)$Letters
+  cld_vec <- multcompView::multcompLetters(pw_p, threshold = 0.15)$Letters
   bd_stats <- bd_stats %>% mutate(letter = cld_vec[as.character(Metod_ID)])
 } else { bd_stats <- bd_stats %>% mutate(letter = "") }
 
@@ -979,3 +979,54 @@ print(Figure_5)
 ggsave(
   filename = "Figures/Figure_5_master_economics_global_transferability.pdf",  plot = Figure_5,
   width = 16,  height = 11,  units = "in",  device = cairo_pdf,  bg = "white")
+
+
+# ------------------------------------------------------------------------------
+# General linear mixed effect modelling
+# ------------------------------------------------------------------------------
+df_model <- fish_by_event_sp%>%mutate(Month = case_when(
+  Month == "Apr" ~ 4,
+  Month == "May" ~ 5,
+  Month == "Jun" ~ 6,
+  Month == "Jul" ~ 7,
+  Month == "Aug" ~ 8,
+  Month == "Sep" ~ 9,
+  Month == "Oct" ~ 10))%>%
+  complete(Metod_ID, Species, Sample_No,
+           fill = list(n_total = 0)) %>%
+  group_by(Sample_No) %>%
+  fill(Pond_No, Month, .direction = "downup") %>%
+  ungroup() %>% mutate(Count = n_total+0.0001)
+
+m1 <- glmmTMB(
+  log(Count) ~ Metod_ID + Species + Sample_No + Month + (1 | Pond_No),
+  data = df_model, 
+  family = gaussian(link = "identity")
+)
+
+a<-summary(m1)
+model_parameters(m1, ci = 0.95)
+r2_nakagawa(m1, tolerance = 1e-100)
+res<-emmeans::emmeans(m1, ~ Metod_ID, component="response")
+summary(res)
+res<-emmeans::emmeans(m1, ~ Species, component="response")
+summary(res)
+res<-emmeans::emmeans(m1, ~ Month, component="response")
+summary(res)
+res<-emmeans::emmeans(m1, ~ Sample_No, component="response")
+summary(res)
+
+df_model2 <- fish_indiv%>%mutate(Month = case_when(
+  Month == "Apr" ~ 4,
+  Month == "May" ~ 5,
+  Month == "Jun" ~ 6,
+  Month == "Jul" ~ 7,
+  Month == "Aug" ~ 8,
+  Month == "Sep" ~ 9,
+  Month == "Oct" ~ 10))%>%filter(Species == "Pseudorasbora parva")
+
+m1 <- glmmTMB(
+  log(`SL (mm)`) ~ Metod_ID + Sample_No + Month + (1 | Pond_No),
+  data = df_model2, 
+  family = gaussian(link = "identity")
+)
